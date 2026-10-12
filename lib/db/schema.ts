@@ -1,0 +1,705 @@
+import { KNOWLEDGE_CHUNK_SUPPORT_SCHEMA, SOURCE_CHUNKS_SCHEMA } from "./knowledge-schema.ts";
+import { EMBEDDING_SCHEMA } from "./embedding-schema.ts";
+
+export const DATABASE_SCHEMA_VERSION = 18;
+
+/**
+ * 给已存在的表加列：`CREATE TABLE IF NOT EXISTS` 对已建好的表会整条跳过，
+ * 新列不会出现。新库由上面的建表语句直接带上该列，老库靠这里补齐。
+ * SQLite 的 ADD COLUMN 只接受可空列或常量默认值，改列/删列需另想办法。
+ */
+export const COLUMN_ADDITIONS: Array<{ table: string; column: string; ddl: string }> = [
+  { table: "goals", column: "target_date", ddl: "ALTER TABLE goals ADD COLUMN target_date TEXT" },
+  { table: "course_lessons", column: "generation_mode", ddl: "ALTER TABLE course_lessons ADD COLUMN generation_mode TEXT NOT NULL DEFAULT 'llm'" },
+  { table: "course_lessons", column: "generation_status", ddl: "ALTER TABLE course_lessons ADD COLUMN generation_status TEXT NOT NULL DEFAULT 'ready'" },
+  { table: "course_lessons", column: "difficulty", ddl: "ALTER TABLE course_lessons ADD COLUMN difficulty INTEGER NOT NULL DEFAULT 3" },
+  { table: "diagnostic_assessments", column: "min_questions", ddl: "ALTER TABLE diagnostic_assessments ADD COLUMN min_questions INTEGER NOT NULL DEFAULT 5" },
+  { table: "diagnostic_assessments", column: "max_questions", ddl: "ALTER TABLE diagnostic_assessments ADD COLUMN max_questions INTEGER NOT NULL DEFAULT 8" },
+  { table: "diagnostic_assessments", column: "answered_count", ddl: "ALTER TABLE diagnostic_assessments ADD COLUMN answered_count INTEGER NOT NULL DEFAULT 0" },
+  { table: "diagnostic_assessments", column: "adaptive_state_json", ddl: "ALTER TABLE diagnostic_assessments ADD COLUMN adaptive_state_json TEXT NOT NULL DEFAULT '{}'" },
+  { table: "goal_skills", column: "capability_type", ddl: "ALTER TABLE goal_skills ADD COLUMN capability_type TEXT NOT NULL DEFAULT 'conceptual_understanding'" },
+  { table: "course_lessons", column: "current_content_version_id", ddl: "ALTER TABLE course_lessons ADD COLUMN current_content_version_id TEXT" },
+  { table: "course_lessons", column: "source_status", ddl: "ALTER TABLE course_lessons ADD COLUMN source_status TEXT NOT NULL DEFAULT 'unverified'" },
+  { table: "course_lessons", column: "quality_status", ddl: "ALTER TABLE course_lessons ADD COLUMN quality_status TEXT NOT NULL DEFAULT 'legacy'" },
+  { table: "course_lessons", column: "capability_type", ddl: "ALTER TABLE course_lessons ADD COLUMN capability_type TEXT NOT NULL DEFAULT 'conceptual_understanding'" },
+  { table: "course_lessons", column: "prerequisites_json", ddl: "ALTER TABLE course_lessons ADD COLUMN prerequisites_json TEXT NOT NULL DEFAULT '[]'" },
+  { table: "course_lessons", column: "completion_evidence_json", ddl: "ALTER TABLE course_lessons ADD COLUMN completion_evidence_json TEXT NOT NULL DEFAULT '[]'" },
+  { table: "lesson_assessment_attempts", column: "content_version_id", ddl: "ALTER TABLE lesson_assessment_attempts ADD COLUMN content_version_id TEXT" },
+  { table: "lesson_assessment_attempts", column: "questions_json", ddl: "ALTER TABLE lesson_assessment_attempts ADD COLUMN questions_json TEXT NOT NULL DEFAULT '[]'" },
+  { table: "retrieval_runs", column: "lesson_id", ddl: "ALTER TABLE retrieval_runs ADD COLUMN lesson_id TEXT REFERENCES course_lessons(id) ON DELETE SET NULL" },
+  { table: "retrieval_runs", column: "skill_id", ddl: "ALTER TABLE retrieval_runs ADD COLUMN skill_id TEXT REFERENCES goal_skills(id) ON DELETE SET NULL" },
+  { table: "retrieval_runs", column: "retrieval_mode", ddl: "ALTER TABLE retrieval_runs ADD COLUMN retrieval_mode TEXT NOT NULL DEFAULT 'fts5'" },
+  { table: "retrieval_runs", column: "max_evidence_tokens", ddl: "ALTER TABLE retrieval_runs ADD COLUMN max_evidence_tokens INTEGER NOT NULL DEFAULT 2000" },
+  { table: "retrieval_runs", column: "total_evidence_tokens", ddl: "ALTER TABLE retrieval_runs ADD COLUMN total_evidence_tokens INTEGER NOT NULL DEFAULT 0" },
+  { table: "retrieval_runs", column: "insufficiency_reason", ddl: "ALTER TABLE retrieval_runs ADD COLUMN insufficiency_reason TEXT NOT NULL DEFAULT ''" },
+  { table: "retrieval_run_items", column: "snapshot_text", ddl: "ALTER TABLE retrieval_run_items ADD COLUMN snapshot_text TEXT NOT NULL DEFAULT ''" },
+  { table: "retrieval_run_items", column: "snapshot_hash", ddl: "ALTER TABLE retrieval_run_items ADD COLUMN snapshot_hash TEXT NOT NULL DEFAULT ''" },
+  { table: "question_source_links", column: "lesson_content_version_id", ddl: "ALTER TABLE question_source_links ADD COLUMN lesson_content_version_id TEXT REFERENCES lesson_content_versions(id) ON DELETE CASCADE" },
+  { table: "question_source_links", column: "retrieval_run_id", ddl: "ALTER TABLE question_source_links ADD COLUMN retrieval_run_id TEXT REFERENCES retrieval_runs(id) ON DELETE CASCADE" },
+  { table: "question_source_links", column: "source_snapshot_hash", ddl: "ALTER TABLE question_source_links ADD COLUMN source_snapshot_hash TEXT NOT NULL DEFAULT ''" },
+  { table: "knowledge_sources", column: "description", ddl: "ALTER TABLE knowledge_sources ADD COLUMN description TEXT NOT NULL DEFAULT ''" },
+  { table: "knowledge_sources", column: "active_chunk_set_id", ddl: "ALTER TABLE knowledge_sources ADD COLUMN active_chunk_set_id TEXT REFERENCES source_chunk_sets(id) ON DELETE SET NULL" },
+  { table: "retrieval_runs", column: "pipeline_run_id", ddl: "ALTER TABLE retrieval_runs ADD COLUMN pipeline_run_id TEXT REFERENCES pipeline_runs(id) ON DELETE SET NULL" },
+  { table: "retrieval_runs", column: "embedding_profile_id", ddl: "ALTER TABLE retrieval_runs ADD COLUMN embedding_profile_id TEXT REFERENCES embedding_profiles(id) ON DELETE SET NULL" },
+  { table: "goal_learning_profiles", column: "source_scope_mode", ddl: "ALTER TABLE goal_learning_profiles ADD COLUMN source_scope_mode TEXT NOT NULL DEFAULT 'auto' CHECK (source_scope_mode IN ('auto', 'selected'))" },
+];
+
+export const DATABASE_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS lesson_grade_requests (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    request_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    owner_token TEXT NOT NULL,
+    lease_until INTEGER NOT NULL,
+    result_json TEXT,
+    PRIMARY KEY (user_id, request_id)
+  );
+  CREATE TABLE IF NOT EXISTS lesson_answer_drafts (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    lesson_id TEXT NOT NULL REFERENCES course_lessons(id) ON DELETE CASCADE,
+    question_fingerprint TEXT NOT NULL,
+    answers_json TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, lesson_id, question_fingerprint)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS web_research_runs (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    query TEXT NOT NULL, created_at TEXT NOT NULL
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS web_research_actions (
+    run_id TEXT NOT NULL REFERENCES web_research_runs(id) ON DELETE CASCADE,
+    action_key TEXT NOT NULL, result_json TEXT NOT NULL,
+    PRIMARY KEY(run_id, action_key)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS web_search_candidates (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    query TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, snippet TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS web_source_imports (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    url TEXT NOT NULL, source_id TEXT NOT NULL REFERENCES knowledge_sources(id) ON DELETE CASCADE,
+    fetched_at TEXT NOT NULL, PRIMARY KEY(user_id, url)
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS web_page_reviews (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    cache_key TEXT NOT NULL, result_json TEXT NOT NULL, created_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, cache_key)
+  ) STRICT;
+  PRAGMA foreign_keys = ON;
+
+  CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    password_hash TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    action_streak_days INTEGER NOT NULL DEFAULT 0 CHECK (action_streak_days >= 0),
+    level INTEGER NOT NULL DEFAULT 1 CHECK (level >= 1),
+    role TEXT NOT NULL DEFAULT '探索者',
+    focus_score INTEGER NOT NULL DEFAULT 0 CHECK (focus_score BETWEEN 0 AND 100),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+  CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+
+  CREATE TABLE IF NOT EXISTS goals (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    progress_percent INTEGER NOT NULL DEFAULT 0 CHECK (progress_percent BETWEEN 0 AND 100),
+    horizon TEXT NOT NULL DEFAULT '',
+    target_date TEXT,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'review', 'completed', 'archived')),
+    progress_source TEXT NOT NULL DEFAULT 'user' CHECK (progress_source IN ('user', 'agent', 'system')),
+    progress_updated_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_goals_user_status ON goals(user_id, status);
+
+  CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    subtitle TEXT NOT NULL DEFAULT '',
+    time_label TEXT NOT NULL DEFAULT '',
+    duration_minutes INTEGER NOT NULL DEFAULT 0 CHECK (duration_minutes >= 0),
+    xp_reward INTEGER NOT NULL DEFAULT 0 CHECK (xp_reward >= 0),
+    coin_reward INTEGER NOT NULL DEFAULT 0 CHECK (coin_reward >= 0),
+    status TEXT NOT NULL DEFAULT 'upcoming' CHECK (status IN ('current', 'upcoming', 'done', 'skipped')),
+    kind TEXT NOT NULL DEFAULT 'focus' CHECK (kind IN ('focus', 'learn', 'exercise', 'life', 'rest')),
+    position INTEGER NOT NULL DEFAULT 0,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks(user_id, status, position);
+
+  CREATE TABLE IF NOT EXISTS activity_logs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    raw_content TEXT NOT NULL,
+    topic TEXT NOT NULL DEFAULT '',
+    kind TEXT CHECK (kind IS NULL OR kind IN ('focus', 'learn', 'exercise', 'life', 'rest')),
+    minutes INTEGER CHECK (minutes IS NULL OR minutes >= 0),
+    output TEXT,
+    intent TEXT NOT NULL DEFAULT 'quick_log' CHECK (intent IN ('quick_log', 'plan_today', 'review')),
+    xp_reward INTEGER NOT NULL DEFAULT 0 CHECK (xp_reward >= 0),
+    coin_reward INTEGER NOT NULL DEFAULT 0 CHECK (coin_reward >= 0),
+    agent_mode TEXT NOT NULL DEFAULT 'demo' CHECK (agent_mode IN ('llm', 'demo')),
+    quiz_id TEXT,
+    quiz_score INTEGER CHECK (quiz_score IS NULL OR quiz_score BETWEEN 0 AND 100),
+    quiz_rewarded INTEGER NOT NULL DEFAULT 0 CHECK (quiz_rewarded IN (0, 1)),
+    occurred_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_activity_logs_user_time ON activity_logs(user_id, occurred_at DESC);
+
+  CREATE TABLE IF NOT EXISTS ledger_entries (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    currency TEXT NOT NULL CHECK (currency IN ('XP', 'COIN')),
+    amount INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_id TEXT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_ledger_user_time ON ledger_entries(user_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS user_learning_profiles (
+    user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    weekday_minutes_json TEXT NOT NULL DEFAULT '[0,0,0,0,0,0,0]',
+    sustainable_weekly_minutes INTEGER NOT NULL DEFAULT 2400
+      CHECK (sustainable_weekly_minutes BETWEEN 60 AND 10080),
+    preferred_period TEXT NOT NULL DEFAULT 'evening'
+      CHECK (preferred_period IN ('morning', 'daytime', 'evening', 'late_night', 'flexible')),
+    preferred_session TEXT NOT NULL DEFAULT 'standard'
+      CHECK (preferred_session IN ('fragment', 'standard', 'long')),
+    habit_note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS goal_learning_profiles (
+    goal_id TEXT PRIMARY KEY REFERENCES goals(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    self_level TEXT NOT NULL CHECK (self_level IN ('beginner', 'familiar', 'intermediate')),
+    weekly_hours INTEGER NOT NULL DEFAULT 4 CHECK (weekly_hours BETWEEN 1 AND 40),
+    background TEXT NOT NULL DEFAULT '',
+    diagnostic_required INTEGER NOT NULL DEFAULT 0 CHECK (diagnostic_required IN (0, 1)),
+    diagnostic_status TEXT NOT NULL DEFAULT 'skipped' CHECK (diagnostic_status IN ('skipped', 'pending', 'in_progress', 'completed', 'failed')),
+    diagnostic_score INTEGER CHECK (diagnostic_score IS NULL OR diagnostic_score BETWEEN 0 AND 100),
+    baseline_summary TEXT NOT NULL DEFAULT '',
+    source_scope_mode TEXT NOT NULL DEFAULT 'auto' CHECK (source_scope_mode IN ('auto', 'selected')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_goal_learning_profiles_user ON goal_learning_profiles(user_id, self_level);
+
+  CREATE TABLE IF NOT EXISTS goal_skills (
+    id TEXT PRIMARY KEY,
+    goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    target_level INTEGER NOT NULL DEFAULT 3 CHECK (target_level BETWEEN 1 AND 5),
+    weight REAL NOT NULL DEFAULT 1.0 CHECK (weight > 0 AND weight <= 10),
+    capability_type TEXT NOT NULL DEFAULT 'conceptual_understanding' CHECK (capability_type IN ('conceptual_understanding', 'procedural_skill', 'problem_solving', 'expression_communication', 'retrieval_discrimination', 'integrated_creation')),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived')),
+    source TEXT NOT NULL DEFAULT 'agent' CHECK (source IN ('agent', 'user', 'system')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(goal_id, name)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_goal_skills_goal ON goal_skills(goal_id, status);
+  CREATE INDEX IF NOT EXISTS idx_goal_skills_user ON goal_skills(user_id, status);
+
+  CREATE TABLE IF NOT EXISTS skill_mastery (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    skill_id TEXT NOT NULL REFERENCES goal_skills(id) ON DELETE CASCADE,
+    mastery_score INTEGER NOT NULL DEFAULT 0 CHECK (mastery_score BETWEEN 0 AND 100),
+    confidence REAL NOT NULL DEFAULT 0 CHECK (confidence BETWEEN 0 AND 1),
+    evidence_count INTEGER NOT NULL DEFAULT 0 CHECK (evidence_count >= 0),
+    last_assessed_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, skill_id)
+  ) WITHOUT ROWID, STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_skill_mastery_user_score ON skill_mastery(user_id, mastery_score);
+
+  CREATE TABLE IF NOT EXISTS learning_programs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    cadence TEXT NOT NULL DEFAULT '',
+    outcomes_json TEXT NOT NULL DEFAULT '[]',
+    instructor_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('draft', 'active', 'completed', 'archived')),
+    generation_mode TEXT NOT NULL DEFAULT 'demo' CHECK (generation_mode IN ('llm', 'demo', 'manual')),
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(goal_id, version)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_learning_programs_user_status ON learning_programs(user_id, status);
+  CREATE INDEX IF NOT EXISTS idx_learning_programs_goal ON learning_programs(goal_id, version DESC);
+
+  CREATE TABLE IF NOT EXISTS course_modules (
+    id TEXT PRIMARY KEY,
+    program_id TEXT NOT NULL REFERENCES learning_programs(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    objective TEXT NOT NULL DEFAULT '',
+    position INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(program_id, position)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_course_modules_program ON course_modules(program_id, position);
+
+  CREATE TABLE IF NOT EXISTS course_lessons (
+    id TEXT PRIMARY KEY,
+    program_id TEXT NOT NULL REFERENCES learning_programs(id) ON DELETE CASCADE,
+    module_id TEXT REFERENCES course_modules(id) ON DELETE SET NULL,
+    primary_skill_id TEXT REFERENCES goal_skills(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT '',
+    objective TEXT NOT NULL DEFAULT '',
+    opening TEXT NOT NULL DEFAULT '',
+    explanation TEXT NOT NULL DEFAULT '',
+    example TEXT NOT NULL DEFAULT '',
+    practice TEXT NOT NULL DEFAULT '',
+    deliverable TEXT NOT NULL DEFAULT '',
+    concepts_json TEXT NOT NULL DEFAULT '[]',
+    questions_json TEXT NOT NULL DEFAULT '[]',
+    duration_minutes INTEGER NOT NULL DEFAULT 0 CHECK (duration_minutes >= 0),
+    required_score INTEGER NOT NULL DEFAULT 60 CHECK (required_score BETWEEN 0 AND 100),
+    position INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0),
+    status TEXT NOT NULL DEFAULT 'locked' CHECK (status IN ('locked', 'available', 'in_progress', 'passed', 'archived')),
+    generation_mode TEXT NOT NULL DEFAULT 'llm' CHECK (generation_mode IN ('llm', 'demo', 'manual')),
+    generation_status TEXT NOT NULL DEFAULT 'ready' CHECK (generation_status IN ('planned', 'generating', 'ready', 'failed')),
+    difficulty INTEGER NOT NULL DEFAULT 3 CHECK (difficulty BETWEEN 1 AND 5),
+    current_content_version_id TEXT,
+    source_status TEXT NOT NULL DEFAULT 'unverified' CHECK (source_status IN ('unverified', 'partially_grounded', 'grounded')),
+    quality_status TEXT NOT NULL DEFAULT 'legacy' CHECK (quality_status IN ('legacy', 'pending', 'passed', 'failed')),
+    capability_type TEXT NOT NULL DEFAULT 'conceptual_understanding' CHECK (capability_type IN ('conceptual_understanding', 'procedural_skill', 'problem_solving', 'expression_communication', 'retrieval_discrimination', 'integrated_creation')),
+    prerequisites_json TEXT NOT NULL DEFAULT '[]',
+    completion_evidence_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(program_id, position)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_course_lessons_program ON course_lessons(program_id, position);
+  CREATE INDEX IF NOT EXISTS idx_course_lessons_skill ON course_lessons(primary_skill_id, status);
+
+  CREATE TABLE IF NOT EXISTS lesson_content_versions (
+    id TEXT PRIMARY KEY,
+    lesson_id TEXT NOT NULL REFERENCES course_lessons(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL CHECK (version >= 1),
+    schema_version TEXT NOT NULL DEFAULT '1',
+    content_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ready', 'generation_failed', 'quality_failed', 'source_insufficient')),
+    source_status TEXT NOT NULL DEFAULT 'unverified' CHECK (source_status IN ('unverified', 'partially_grounded', 'grounded')),
+    generation_mode TEXT NOT NULL CHECK (generation_mode IN ('llm', 'rules', 'manual', 'repaired')),
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    prompt_version TEXT NOT NULL DEFAULT '',
+    input_hash TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0 CHECK (prompt_tokens >= 0),
+    completion_tokens INTEGER NOT NULL DEFAULT 0 CHECK (completion_tokens >= 0),
+    total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
+    latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+    fallback_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(lesson_id, version)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_lesson_content_versions_lesson ON lesson_content_versions(lesson_id, version DESC);
+  CREATE INDEX IF NOT EXISTS idx_lesson_content_versions_status ON lesson_content_versions(status, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS lesson_quality_reports (
+    id TEXT PRIMARY KEY,
+    lesson_content_version_id TEXT NOT NULL REFERENCES lesson_content_versions(id) ON DELETE CASCADE,
+    deterministic_passed INTEGER NOT NULL CHECK (deterministic_passed IN (0, 1)),
+    semantic_passed INTEGER NOT NULL CHECK (semantic_passed IN (0, 1)),
+    score INTEGER NOT NULL CHECK (score BETWEEN 0 AND 100),
+    issues_json TEXT NOT NULL DEFAULT '[]',
+    checker_version TEXT NOT NULL,
+    checker_mode TEXT NOT NULL CHECK (checker_mode IN ('llm', 'rules')),
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0 CHECK (prompt_tokens >= 0),
+    completion_tokens INTEGER NOT NULL DEFAULT 0 CHECK (completion_tokens >= 0),
+    total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
+    latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+    created_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_lesson_quality_reports_version ON lesson_quality_reports(lesson_content_version_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS lesson_block_sources (
+    lesson_content_version_id TEXT NOT NULL REFERENCES lesson_content_versions(id) ON DELETE CASCADE,
+    block_id TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    source_snapshot_hash TEXT NOT NULL DEFAULT '',
+    support_type TEXT NOT NULL DEFAULT 'supports' CHECK (support_type IN ('supports', 'contradicts', 'example')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (lesson_content_version_id, block_id, source_ref)
+  ) WITHOUT ROWID, STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_lesson_block_sources_ref ON lesson_block_sources(source_ref);
+
+  CREATE TABLE IF NOT EXISTS task_lesson_links (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    lesson_id TEXT NOT NULL REFERENCES course_lessons(id) ON DELETE CASCADE,
+    required_score INTEGER NOT NULL DEFAULT 60 CHECK (required_score BETWEEN 0 AND 100),
+    completion_rule TEXT NOT NULL DEFAULT 'passing_score' CHECK (completion_rule IN ('passing_score', 'passing_score_and_deliverable', 'manual')),
+    created_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_task_lesson_links_lesson ON task_lesson_links(lesson_id);
+
+  CREATE TABLE IF NOT EXISTS diagnostic_assessments (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    self_level TEXT NOT NULL CHECK (self_level IN ('familiar', 'intermediate')),
+    status TEXT NOT NULL DEFAULT 'generated' CHECK (status IN ('generating', 'generated', 'in_progress', 'completed', 'failed', 'expired')),
+    question_count INTEGER NOT NULL DEFAULT 0 CHECK (question_count >= 0),
+    min_questions INTEGER NOT NULL DEFAULT 5 CHECK (min_questions >= 1),
+    max_questions INTEGER NOT NULL DEFAULT 8 CHECK (max_questions >= min_questions),
+    answered_count INTEGER NOT NULL DEFAULT 0 CHECK (answered_count >= 0),
+    adaptive_state_json TEXT NOT NULL DEFAULT '{}',
+    source TEXT NOT NULL DEFAULT 'llm' CHECK (source IN ('llm', 'rules', 'manual')),
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_diagnostic_assessments_goal ON diagnostic_assessments(goal_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_diagnostic_assessments_user_status ON diagnostic_assessments(user_id, status);
+
+  CREATE TABLE IF NOT EXISTS diagnostic_questions (
+    id TEXT PRIMARY KEY,
+    assessment_id TEXT NOT NULL REFERENCES diagnostic_assessments(id) ON DELETE CASCADE,
+    skill_id TEXT REFERENCES goal_skills(id) ON DELETE SET NULL,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    kind TEXT NOT NULL CHECK (kind IN ('concept', 'explanation', 'application', 'debugging', 'design')),
+    difficulty INTEGER NOT NULL DEFAULT 2 CHECK (difficulty BETWEEN 1 AND 5),
+    prompt TEXT NOT NULL,
+    hint TEXT NOT NULL DEFAULT '',
+    reference_answer TEXT NOT NULL,
+    rubric_json TEXT NOT NULL DEFAULT '{}',
+    max_score INTEGER NOT NULL DEFAULT 10 CHECK (max_score > 0),
+    generated_by TEXT NOT NULL DEFAULT 'llm' CHECK (generated_by IN ('llm', 'rules', 'manual')),
+    created_at TEXT NOT NULL,
+    UNIQUE(assessment_id, position)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_diagnostic_questions_assessment ON diagnostic_questions(assessment_id, position);
+  CREATE INDEX IF NOT EXISTS idx_diagnostic_questions_skill ON diagnostic_questions(skill_id);
+
+  CREATE TABLE IF NOT EXISTS diagnostic_responses (
+    id TEXT PRIMARY KEY,
+    assessment_id TEXT NOT NULL REFERENCES diagnostic_assessments(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL REFERENCES diagnostic_questions(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    skill_id TEXT REFERENCES goal_skills(id) ON DELETE SET NULL,
+    answer TEXT NOT NULL,
+    score INTEGER NOT NULL CHECK (score BETWEEN 0 AND 10),
+    max_score INTEGER NOT NULL DEFAULT 10 CHECK (max_score > 0),
+    feedback TEXT NOT NULL DEFAULT '',
+    grader_mode TEXT NOT NULL CHECK (grader_mode IN ('llm', 'rules', 'manual')),
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    answered_at TEXT NOT NULL,
+    UNIQUE(assessment_id, question_id)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_diagnostic_responses_assessment ON diagnostic_responses(assessment_id, answered_at);
+  CREATE INDEX IF NOT EXISTS idx_diagnostic_responses_skill ON diagnostic_responses(skill_id, answered_at);
+
+  CREATE TABLE IF NOT EXISTS diagnostic_attempts (
+    id TEXT PRIMARY KEY,
+    assessment_id TEXT NOT NULL REFERENCES diagnostic_assessments(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    attempt_number INTEGER NOT NULL DEFAULT 1 CHECK (attempt_number >= 1),
+    answers_json TEXT NOT NULL DEFAULT '{}',
+    score INTEGER CHECK (score IS NULL OR score BETWEEN 0 AND 100),
+    level TEXT CHECK (level IS NULL OR level IN ('unqualified', 'qualified', 'good', 'excellent')),
+    feedback_json TEXT NOT NULL DEFAULT '{}',
+    skill_scores_json TEXT NOT NULL DEFAULT '{}',
+    passed INTEGER NOT NULL DEFAULT 0 CHECK (passed IN (0, 1)),
+    grader_mode TEXT NOT NULL DEFAULT 'pending' CHECK (grader_mode IN ('pending', 'llm', 'rules', 'manual')),
+    started_at TEXT NOT NULL,
+    submitted_at TEXT,
+    UNIQUE(assessment_id, attempt_number)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_diagnostic_attempts_user ON diagnostic_attempts(user_id, started_at DESC);
+
+  CREATE TABLE IF NOT EXISTS lesson_assessment_attempts (
+    id TEXT PRIMARY KEY,
+    lesson_id TEXT NOT NULL REFERENCES course_lessons(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    attempt_number INTEGER NOT NULL DEFAULT 1 CHECK (attempt_number >= 1),
+    answers_json TEXT NOT NULL DEFAULT '{}',
+    score INTEGER CHECK (score IS NULL OR score BETWEEN 0 AND 100),
+    level TEXT CHECK (level IS NULL OR level IN ('unqualified', 'qualified', 'good', 'excellent')),
+    feedback_json TEXT NOT NULL DEFAULT '{}',
+    skill_scores_json TEXT NOT NULL DEFAULT '{}',
+    passed INTEGER NOT NULL DEFAULT 0 CHECK (passed IN (0, 1)),
+    grader_mode TEXT NOT NULL DEFAULT 'pending' CHECK (grader_mode IN ('pending', 'llm', 'rules', 'manual')),
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    content_version_id TEXT,
+    questions_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    submitted_at TEXT,
+    UNIQUE(lesson_id, user_id, attempt_number)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_lesson_attempts_user ON lesson_assessment_attempts(user_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_lesson_attempts_lesson ON lesson_assessment_attempts(lesson_id, attempt_number DESC);
+
+  CREATE TABLE IF NOT EXISTS workflow_runs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    goal_id TEXT REFERENCES goals(id) ON DELETE CASCADE,
+    workflow_type TEXT NOT NULL CHECK (workflow_type IN ('goal_onboarding', 'daily_learning', 'lesson_assessment', 'daily_review')),
+    thread_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'waiting_for_user', 'completed', 'failed', 'cancelled')),
+    current_node TEXT NOT NULL DEFAULT '',
+    waiting_for TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_workflow_runs_user_status ON workflow_runs(user_id, status, updated_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_workflow_runs_goal ON workflow_runs(goal_id, started_at DESC);
+
+  CREATE TABLE IF NOT EXISTS workflow_events (
+    id TEXT PRIMARY KEY,
+    workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    event_index INTEGER NOT NULL CHECK (event_index >= 1),
+    event_type TEXT NOT NULL CHECK (event_type IN (
+      'progress', 'action_requested', 'action_completed', 'waiting', 'completed', 'failed'
+    )),
+    node_name TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(workflow_run_id, event_index)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_workflow_events_run
+    ON workflow_events(workflow_run_id, event_index);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_events_action_result
+    ON workflow_events(workflow_run_id, idempotency_key)
+    WHERE event_type = 'action_completed' AND idempotency_key != '';
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_events_idempotency
+    ON workflow_events(workflow_run_id, idempotency_key)
+    WHERE idempotency_key != '';
+
+  CREATE TABLE IF NOT EXISTS agent_runs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
+    workflow_run_id TEXT REFERENCES workflow_runs(id) ON DELETE SET NULL,
+    agent_type TEXT NOT NULL CHECK (agent_type IN ('planner', 'tutor', 'examiner', 'reviewer', 'router', 'guard')),
+    node_name TEXT NOT NULL DEFAULT '',
+    input_json TEXT NOT NULL DEFAULT '{}',
+    output_json TEXT NOT NULL DEFAULT '{}',
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0 CHECK (prompt_tokens >= 0),
+    completion_tokens INTEGER NOT NULL DEFAULT 0 CHECK (completion_tokens >= 0),
+    total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
+    latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+    status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed', 'fallback')),
+    error_message TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT UNIQUE,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_agent_runs_user_time ON agent_runs(user_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_agent_runs_workflow ON agent_runs(workflow_run_id, created_at);
+
+  CREATE TABLE IF NOT EXISTS knowledge_sources (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL CHECK (kind IN ('text', 'txt', 'pdf', 'docx')),
+    original_filename TEXT NOT NULL DEFAULT '',
+    mime_type TEXT NOT NULL DEFAULT '',
+    byte_size INTEGER NOT NULL DEFAULT 0 CHECK (byte_size >= 0),
+    content_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'processing'
+      CHECK (status IN ('processing', 'ready', 'ocr_required', 'failed', 'deleted')),
+    parser_version TEXT NOT NULL DEFAULT '',
+    current_version_id TEXT,
+    active_chunk_set_id TEXT REFERENCES source_chunk_sets(id) ON DELETE SET NULL,
+    chunk_count INTEGER NOT NULL DEFAULT 0 CHECK (chunk_count >= 0),
+    char_count INTEGER NOT NULL DEFAULT 0 CHECK (char_count >= 0),
+    warning_message TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    deleted_at TEXT
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_knowledge_sources_user_status
+    ON knowledge_sources(user_id, status, updated_at DESC);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_sources_user_hash_active
+    ON knowledge_sources(user_id, content_hash) WHERE status != 'deleted';
+
+  CREATE TABLE IF NOT EXISTS source_versions (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES knowledge_sources(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL CHECK (version >= 1),
+    raw_blob BLOB NOT NULL,
+    extracted_text TEXT NOT NULL DEFAULT '',
+    text_hash TEXT NOT NULL DEFAULT '',
+    parser_version TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK (status IN ('ready', 'ocr_required', 'failed')),
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    UNIQUE(source_id, version)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_source_versions_source
+    ON source_versions(source_id, version DESC);
+
+  ${KNOWLEDGE_CHUNK_SUPPORT_SCHEMA}
+  ${SOURCE_CHUNKS_SCHEMA}
+  ${EMBEDDING_SCHEMA}
+
+  CREATE TABLE IF NOT EXISTS goal_source_links (
+    goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL REFERENCES knowledge_sources(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (goal_id, source_id)
+  ) WITHOUT ROWID, STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_goal_source_links_user
+    ON goal_source_links(user_id, goal_id, status);
+
+  CREATE TABLE IF NOT EXISTS retrieval_runs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
+    lesson_id TEXT REFERENCES course_lessons(id) ON DELETE SET NULL,
+    skill_id TEXT REFERENCES goal_skills(id) ON DELETE SET NULL,
+    agent_run_id TEXT REFERENCES agent_runs(id) ON DELETE SET NULL,
+    pipeline_run_id TEXT REFERENCES pipeline_runs(id) ON DELETE SET NULL,
+    embedding_profile_id TEXT REFERENCES embedding_profiles(id) ON DELETE SET NULL,
+    tool_name TEXT NOT NULL DEFAULT 'search_knowledge_base',
+    retrieval_mode TEXT NOT NULL DEFAULT 'fts5',
+    query TEXT NOT NULL,
+    filters_json TEXT NOT NULL DEFAULT '{}',
+    top_k INTEGER NOT NULL DEFAULT 5 CHECK (top_k BETWEEN 1 AND 50),
+    max_evidence_tokens INTEGER NOT NULL DEFAULT 2000 CHECK (max_evidence_tokens BETWEEN 100 AND 20000),
+    result_count INTEGER NOT NULL DEFAULT 0 CHECK (result_count >= 0),
+    total_evidence_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_evidence_tokens >= 0),
+    status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+    insufficiency_reason TEXT NOT NULL DEFAULT '',
+    latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+    created_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_retrieval_runs_user_time
+    ON retrieval_runs(user_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS retrieval_run_items (
+    id TEXT PRIMARY KEY,
+    retrieval_run_id TEXT NOT NULL REFERENCES retrieval_runs(id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL REFERENCES knowledge_sources(id) ON DELETE CASCADE,
+    source_version_id TEXT NOT NULL REFERENCES source_versions(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL REFERENCES source_chunks(id) ON DELETE CASCADE,
+    rank INTEGER NOT NULL CHECK (rank >= 1),
+    score REAL NOT NULL,
+    excerpt TEXT NOT NULL DEFAULT '',
+    snapshot_text TEXT NOT NULL DEFAULT '',
+    snapshot_hash TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(retrieval_run_id, rank)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS idx_retrieval_items_run
+    ON retrieval_run_items(retrieval_run_id, rank);
+
+  CREATE TABLE IF NOT EXISTS knowledge_gates (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    decision_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new',
+    rag_count INTEGER NOT NULL DEFAULT 0 CHECK(rag_count BETWEEN 0 AND 2),
+    web_count INTEGER NOT NULL DEFAULT 0 CHECK(web_count BETWEEN 0 AND 1),
+    page_count INTEGER NOT NULL DEFAULT 0 CHECK(page_count BETWEEN 0 AND 3),
+    evidence_json TEXT NOT NULL DEFAULT 'null', source_fingerprint TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS knowledge_gate_candidates (
+    gate_id TEXT NOT NULL REFERENCES knowledge_gates(id) ON DELETE CASCADE,
+    candidate_id TEXT NOT NULL REFERENCES web_search_candidates(id) ON DELETE CASCADE,
+    PRIMARY KEY(gate_id,candidate_id)
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS question_source_links (
+    question_type TEXT NOT NULL CHECK (question_type IN ('diagnostic', 'lesson')),
+    question_id TEXT NOT NULL,
+    lesson_content_version_id TEXT REFERENCES lesson_content_versions(id) ON DELETE CASCADE,
+    retrieval_run_id TEXT REFERENCES retrieval_runs(id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL REFERENCES knowledge_sources(id) ON DELETE CASCADE,
+    source_version_id TEXT NOT NULL REFERENCES source_versions(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL REFERENCES source_chunks(id) ON DELETE CASCADE,
+    source_snapshot_hash TEXT NOT NULL DEFAULT '',
+    support_type TEXT NOT NULL DEFAULT 'supports'
+      CHECK (support_type IN ('supports', 'contradicts', 'example')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (question_type, question_id, chunk_id)
+  ) WITHOUT ROWID, STRICT;
+`;
